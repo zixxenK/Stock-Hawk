@@ -1,42 +1,80 @@
-from sqlalchemy import create_engine, Column, Integer, String, Float, LargeBinary
-from sqlalchemy.orm import sessionmaker
-# Assume Base is defined and all models are registered.
+from sqlalchemy import create_engine, Column, Integer, String, Float, DateTime, Boolean
+from sqlalchemy.orm import declarative_base, sessionmaker
+import logging
 
-class DBManager:
-    def __init__(self):
-        print("Initializing Database Manager...")
-        # In a real scenario, this initializes the ORM engine and checks schema existence.
-        pass
+logger = logging.getLogger(__name__)
+Base = declarative_base()
 
-    def get_session(self):
-        """Provides a transactional database session."""
-        return self._create_engine().begin()
+# --- Schemas ---
+class DBPoliticalTrade(Base):
+    __tablename__ = "political_trades"
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    ticker = Column(String(10), index=True, nullable=False)
+    politician = Column(String(100))
+    chamber = Column(String(20))
+    transaction_type = Column(String(20))
+    amount_midpoint = Column(Float)
+    transaction_date = Column(String(20), index=True)
 
-    def save_raw_page(self, source: str, url: str, raw_bytes: bytes) -> None:
-        """Saves the raw data to the Data Lake table (auditable storage)."""
-        print(f"[DB] Saving {source} raw page for {url[:20]}...")
-        # Implementation uses SQLAlchemy insert/update on RawScrapePage model.
+class DBInsiderTrade(Base):
+    __tablename__ = "insider_trades"
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    ticker = Column(String(10), index=True, nullable=False)
+    insider_name = Column(String(100))
+    title = Column(String(50))
+    total_value = Column(Float)
+    transaction_date = Column(String(20), index=True)
 
-    def upsert_insider_trade(self, record: dict) -> bool:
-        """Inserts or updates an insider trade record."""
-        print(f"[DB] Upserting Insider Trade for {record['ticker']}...")
-        # Implementation uses the TradeRecord schema and transactional logic.
+# --- Manager ---
+class DatabaseManager:
+    """
+    Handles connections and specific queries to the Flippy SQLite database.
+    """
+    def __init__(self, db_url: str = "sqlite:///market_intelligence.db"):
+        self.engine = create_engine(db_url, echo=False)
+        Base.metadata.create_all(self.engine)
+        self.Session = sessionmaker(bind=self.engine)
 
-    def get_congress_trades(self, ticker: str, days_back: int) -> list[dict]:
-        """Retrieves recent trades from both SEC and Congress sources."""
-        print(f"[DB] Retrieving {days_back} day history.")
-        return [{"ticker": ticker, "shares": 100, "price": 50.0}] # Stub return
+    def save_congress_trades(self, trades: list):
+        """Saves a list of CongressTrade Pydantic models to the DB."""
+        session = self.Session()
+        try:
+            for t in trades:
+                # Basic deduplication logic could be added here
+                db_trade = DBPoliticalTrade(
+                    ticker=t.ticker,
+                    politician=t.politician,
+                    chamber=t.chamber,
+                    transaction_type=t.transaction_type,
+                    amount_midpoint=t.amount_midpoint,
+                    transaction_date=t.transaction_date
+                )
+                session.add(db_trade)
+            session.commit()
+            logger.info(f"Saved {len(trades)} congressional trades to database.")
+        except Exception as e:
+            session.rollback()
+            logger.error(f"Failed to save congress trades: {e}")
+        finally:
+            session.close()
 
-    def save_historical_outcome(self, state_vector: np.ndarray, reward: float, trade_return: float) -> None:
-        """Saves a completed trade outcome to train the PatternMemory."""
-        print("[DB] Recording historical outcome...")
-        # Saves vector fingerprint and associated outcomes.
-
-    def get_signal_metadata(self, ticker: str, days_back: int) -> list[dict]:
-        """Retrieves all similar historical signals for comparison."""
-        print(f"[DB] Fetching signal metadata for {ticker}...")
-        return [] # Stub return
-    def upsert_signal_metadata(self, ticker: str, composite_score: float, action: str, source_data: dict) -> None:
-        """Saves the metadata for a generated signal, including the source data."""
-        print(f"[DB] Upserting signal metadata for {ticker} with score {composite_score:.2f}...")
-        # Implementation uses the SignalMetadata schema and transactional logic.
+    def save_insider_trades(self, trades: list):
+        """Saves a list of InsiderTrade Pydantic models to the DB."""
+        session = self.Session()
+        try:
+            for t in trades:
+                db_trade = DBInsiderTrade(
+                    ticker=t.ticker,
+                    insider_name=t.insider_name,
+                    title=t.title,
+                    total_value=t.total_value,
+                    transaction_date=t.transaction_date
+                )
+                session.add(db_trade)
+            session.commit()
+            logger.info(f"Saved {len(trades)} corporate insider trades to database.")
+        except Exception as e:
+            session.rollback()
+            logger.error(f"Failed to save insider trades: {e}")
+        finally:
+            session.close()
