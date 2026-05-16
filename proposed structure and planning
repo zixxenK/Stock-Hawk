@@ -1,0 +1,25 @@
+flippy_engine/
+├── config/
+│   ├── settings.py           # Global configuration management (API keys, constants)
+│   └── __init__.py
+├── database/
+│   ├── db_manager.py         # Handles all DB connections and transactions
+│   ├── models.py             # Pydantic models for structured data storage
+│   └── __init__.py
+├── data_sources/
+│   ├── scraper_manager.py    # Orchestrates all external scraping calls (Rate limiting, fallback logic)
+│   ├── __init__.py           # Imports and manages the specific scrapers
+├── processing/
+│   ├── vectorizer.py         # Feature creation and standardization
+│   ├── sentiment_processor.py# Wraps NLP analysis results into structured vectors
+│   └── data_cleaner.py       # General ETL pipeline for all incoming raw data
+├── intelligence/
+│   ├── memory.py             # PatternMemory logic (Cosine Similarity)
+│   ├── agent.py              # The core Q-Learning Agent and scoring mechanism.
+│   └── model_trainer.py      # Handles offline ML training, backtesting, and weight updates.
+├── api/
+│   ├── fast_api_app.py       # FastAPI entry point for the dashboard API calls.
+│   └── uielements.py        # Utility functions for UI data shaping.
+├── main.py                  # The primary execution script (The Golden Loop)
+├── requirements.txt         # All dependencies
+└── README.md                # Documentation and setup guide

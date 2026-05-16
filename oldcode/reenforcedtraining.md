@@ -1,0 +1,5 @@
+profitable greater than .2 perent invested then reward the bot with a score boost. If the bot's position is unprofitable or less than .2 percent invested, then penalize the bot with a score reduction. This encourages the bot to make more profitable trades and avoid over-investing in risky positions.
+for more information on reinforcement learning, see https://www.coursera.org/learn/practical-rl
+utilize the reward function to optimize the bot's trading strategy and improve its performance over time.
+make it seek underlying patterns in the market and adjust its trading decisions accordingly. This can lead to more informed and profitable trades, as the bot learns from its past experiences and adapts to changing market conditions.
+pattern recognition can help the bot identify trends, support and resistance levels, and other key indicators that can inform its trading decisions. By analyzing historical data and learning from it, the bot can make more informed predictions about future price movements and adjust its strategy accordingly.

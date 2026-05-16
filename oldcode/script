@@ -1,0 +1,7 @@
+Create new package directories
+bash
+
+mkdir -p /home/claude/momentum_scanner/{data_sources,database,signals}
+Output
+
+exit code 0
