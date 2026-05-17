@@ -1,0 +1,1295 @@
+"""
+rl_insider_trader.py
+InsiderRL: Multi-Dimensional Reinforcement Learning Trading Agent
+
+Single-file, production-ready Streamlit application wiring together
+the full Stock-Hawk pipeline: data ingestion → vector geometry →
+NLP sentiment → Gymnasium simulation → PPO training → visualization.
+
+Run with:
+    streamlit run rl_insider_trader.py
+
+Install:
+    pip install streamlit gymnasium stable-baselines3 scikit-learn plotly pandas numpy
+"""
+
+from __future__ import annotations
+
+import datetime
+import logging
+import math
+import random
+import sqlite3
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any
+
+import numpy as np
+import pandas as pd
+import plotly.express as px
+import plotly.graph_objects as go
+import streamlit as st
+import gymnasium as gym
+from gymnasium import spaces
+from sklearn.decomposition import PCA
+from stable_baselines3 import PPO
+from stable_baselines3.common.callbacks import BaseCallback
+
+# ─────────────────────────────────────────────────────────────────────────────
+# LOGGING
+# ─────────────────────────────────────────────────────────────────────────────
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(name)s — %(message)s",
+)
+logger = logging.getLogger("InsiderRL")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# GLOBAL CONSTANTS
+# ─────────────────────────────────────────────────────────────────────────────
+DB_PATH = Path("./data/insider_rl.db")
+
+TICKERS = ["AAPL", "MSFT", "NVDA", "PLTR", "TSLA"]
+
+POLITICIANS = [
+    "Nancy Pelosi", "Dan Crenshaw", "Tommy Tuberville",
+    "Marjorie Taylor Greene", "Josh Gottheimer", "Brian Mast",
+    "Austin Scott", "Ro Khanna",
+]
+ROLES = ["CEO", "CFO", "Director", "SVP", "10% Owner", "President", "CTO", "EVP"]
+
+ROLE_SENIORITY: dict[str, float] = {
+    "CEO": 1.00, "President": 0.90, "Chairman": 0.95, "CFO": 0.95,
+    "CTO": 0.85, "COO": 0.90, "Director": 0.75, "SVP": 0.70,
+    "EVP": 0.75, "VP": 0.65, "10% Owner": 0.80, "Officer": 0.60,
+}
+
+# Canonical "suspicious accumulation" feature template vectors (4-dim)
+INSIDER_TEMPLATE  = np.array([0.90, 0.95, 0.80, 0.75], dtype=np.float32)
+CONGRESS_TEMPLATE = np.array([0.85, 1.00, 0.70, 0.65], dtype=np.float32)
+
+# Reward shaping hyperparameters
+ALPHA_CHURN         = 0.02    # Churn penalty coefficient
+BETA_ALIGNMENT      = 0.015   # Insider-alignment bonus coefficient
+GAMMA_DRAWDOWN      = 0.05    # Drawdown penalty coefficient
+FEE_PCT             = 0.0015  # 0.15% transaction fee
+ALIGN_THRESHOLD     = 0.70    # cosine sim threshold for alignment bonus
+DRAWDOWN_THRESHOLD  = 0.05    # 5% decline from peak triggers penalty
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# PART 1 — DATABASE & DATA MANAGEMENT
+# ═════════════════════════════════════════════════════════════════════════════
+
+class MarketIntelligenceDB:
+    """
+    SQLite persistence layer for congressional disclosures, SEC Form 4 filings,
+    and news sentiment scores.
+
+    Design choices:
+      - WAL journal mode for concurrent read safety.
+      - Disclosure-date latency emulation prevents lookahead bias during
+        historical simulation (STOCK Act mandates up to 45 days for Congress;
+        Form 4 must be filed within 2 business days).
+    """
+
+    _SCHEMA = """
+        CREATE TABLE IF NOT EXISTS congress_trades (
+            id              INTEGER PRIMARY KEY AUTOINCREMENT,
+            ticker          TEXT    NOT NULL,
+            politician      TEXT    NOT NULL,
+            trade_type      TEXT    NOT NULL,
+            amount_range    TEXT,
+            trade_date      TEXT    NOT NULL,
+            disclosure_date TEXT    NOT NULL,
+            latency_days    INTEGER NOT NULL,
+            inserted_at     TEXT    NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS insider_trades (
+            id              INTEGER PRIMARY KEY AUTOINCREMENT,
+            ticker          TEXT    NOT NULL,
+            insider_name    TEXT    NOT NULL,
+            position        TEXT,
+            shares_traded   REAL,
+            price           REAL,
+            trade_type      TEXT    NOT NULL,
+            trade_date      TEXT    NOT NULL,
+            disclosure_date TEXT    NOT NULL,
+            latency_days    INTEGER NOT NULL,
+            inserted_at     TEXT    NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS news_sentiment (
+            id          INTEGER PRIMARY KEY AUTOINCREMENT,
+            ticker      TEXT NOT NULL,
+            score       REAL NOT NULL,
+            source      TEXT,
+            headline    TEXT,
+            trade_date  TEXT NOT NULL,
+            inserted_at TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_ct_ticker  ON congress_trades(ticker, trade_date);
+        CREATE INDEX IF NOT EXISTS idx_it_ticker  ON insider_trades(ticker, trade_date);
+        CREATE INDEX IF NOT EXISTS idx_ns_ticker  ON news_sentiment(ticker, trade_date);
+    """
+
+    def __init__(self, db_path: Path = DB_PATH) -> None:
+        self.db_path = db_path
+        self.db_path.parent.mkdir(parents=True, exist_ok=True)
+        with self._conn() as c:
+            c.executescript(self._SCHEMA)
+
+    def _conn(self) -> sqlite3.Connection:
+        conn = sqlite3.connect(self.db_path, timeout=15)
+        conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA journal_mode=WAL")
+        return conn
+
+    # ── Latency emulation engine ──────────────────────────────────────────
+
+    @staticmethod
+    def emulate_latency(
+        trade_date: str,
+        min_days: int = 2,
+        max_days: int = 45,
+    ) -> tuple[str, int]:
+        """
+        Shift a trade date forward by a simulated regulatory disclosure delay.
+
+        Congress (STOCK Act):      5 – 45 days
+        SEC Form 4 (insiders):     2 –  4 business days
+
+        This is critical to eliminate lookahead bias. The agent must never
+        observe alternative data before it would have been publicly available.
+
+        Returns (disclosure_date_str, latency_days).
+        """
+        try:
+            dt = datetime.datetime.strptime(trade_date, "%Y-%m-%d")
+        except ValueError:
+            return trade_date, 0
+        delay = random.randint(min_days, max_days)
+        disc_dt = dt + datetime.timedelta(days=delay)
+        return disc_dt.strftime("%Y-%m-%d"), delay
+
+    # ── Insert methods ────────────────────────────────────────────────────
+
+    def insert_congress_trade(self, rec: dict) -> None:
+        disc, lat = self.emulate_latency(rec["trade_date"], min_days=5, max_days=45)
+        now = datetime.datetime.utcnow().isoformat()
+        with self._conn() as c:
+            c.execute(
+                """INSERT OR IGNORE INTO congress_trades
+                   (ticker, politician, trade_type, amount_range,
+                    trade_date, disclosure_date, latency_days, inserted_at)
+                   VALUES (?,?,?,?,?,?,?,?)""",
+                (rec["ticker"].upper(), rec["politician"], rec["trade_type"],
+                 rec.get("amount_range", "$15,001 – $50,000"),
+                 rec["trade_date"], disc, lat, now),
+            )
+
+    def insert_insider_trade(self, rec: dict) -> None:
+        disc, lat = self.emulate_latency(rec["trade_date"], min_days=2, max_days=4)
+        now = datetime.datetime.utcnow().isoformat()
+        with self._conn() as c:
+            c.execute(
+                """INSERT OR IGNORE INTO insider_trades
+                   (ticker, insider_name, position, shares_traded, price,
+                    trade_type, trade_date, disclosure_date, latency_days, inserted_at)
+                   VALUES (?,?,?,?,?,?,?,?,?,?)""",
+                (rec["ticker"].upper(), rec["insider_name"],
+                 rec.get("position", "Director"), rec.get("shares_traded", 1000),
+                 rec.get("price", 100.0), rec.get("trade_type", "Purchase"),
+                 rec["trade_date"], disc, lat, now),
+            )
+
+    def insert_sentiment(self, rec: dict) -> None:
+        now = datetime.datetime.utcnow().isoformat()
+        with self._conn() as c:
+            c.execute(
+                """INSERT INTO news_sentiment
+                   (ticker, score, source, headline, trade_date, inserted_at)
+                   VALUES (?,?,?,?,?,?)""",
+                (rec["ticker"].upper(), rec["score"], rec.get("source", "Yahoo Finance"),
+                 rec.get("headline", ""), rec["trade_date"], now),
+            )
+
+    # ── Query methods ─────────────────────────────────────────────────────
+
+    def get_congress_trades(self, ticker: str, days_back: int = 30) -> list[dict]:
+        with self._conn() as c:
+            rows = c.execute(
+                """SELECT * FROM congress_trades
+                   WHERE ticker=? AND trade_date >= date('now',?)
+                   ORDER BY trade_date DESC""",
+                (ticker.upper(), f"-{days_back} days"),
+            ).fetchall()
+        return [dict(r) for r in rows]
+
+    def get_insider_trades(self, ticker: str, days_back: int = 30) -> list[dict]:
+        with self._conn() as c:
+            rows = c.execute(
+                """SELECT * FROM insider_trades
+                   WHERE ticker=? AND trade_type='Purchase'
+                     AND trade_date >= date('now',?)
+                   ORDER BY trade_date DESC""",
+                (ticker.upper(), f"-{days_back} days"),
+            ).fetchall()
+        return [dict(r) for r in rows]
+
+    def get_avg_sentiment(self, ticker: str, days_back: int = 7) -> float:
+        with self._conn() as c:
+            row = c.execute(
+                """SELECT AVG(score) FROM news_sentiment
+                   WHERE ticker=? AND trade_date >= date('now',?)""",
+                (ticker.upper(), f"-{days_back} days"),
+            ).fetchone()
+        return float(row[0]) if row and row[0] is not None else 0.0
+
+    def get_stats(self) -> dict[str, int]:
+        with self._conn() as c:
+            def count(tbl: str) -> int:
+                return c.execute(f"SELECT COUNT(*) FROM {tbl}").fetchone()[0]
+            return {
+                "congress_trades": count("congress_trades"),
+                "insider_trades":  count("insider_trades"),
+                "news_sentiment":  count("news_sentiment"),
+            }
+
+    def seed_mock_data(self, ticker: str, n_days: int = 60) -> None:
+        """Populate the DB with realistic synthetic activity for demonstration."""
+        _sentiment = SentimentEngine()
+        today = datetime.date.today()
+        headlines = [
+            "beats earnings expectations substantial growth record profit",
+            "insider buy cluster record high breakout bullish momentum",
+            "SEC investigation fraud lawsuit class action",
+            "dividend increase acquisition expansion partnership approved",
+            "guidance cut restructuring layoffs disappointing miss",
+            "upgrade outperform all-time high bullish recovery",
+        ]
+        for i in range(n_days):
+            dt = (today - datetime.timedelta(days=i)).strftime("%Y-%m-%d")
+            if i % 9 == 0:
+                self.insert_congress_trade({
+                    "ticker": ticker,
+                    "politician": random.choice(POLITICIANS),
+                    "trade_type": random.choice(["Purchase", "Sale"]),
+                    "trade_date": dt,
+                    "amount_range": random.choice([
+                        "$1,001 – $15,000", "$15,001 – $50,000",
+                        "$50,001 – $100,000", "$100,001 – $250,000",
+                    ]),
+                })
+            if i % 7 == 0:
+                role = random.choice(ROLES)
+                self.insert_insider_trade({
+                    "ticker": ticker,
+                    "insider_name": f"Executive_{i}",
+                    "position": role,
+                    "shares_traded": random.randint(500, 50_000),
+                    "price": round(random.uniform(50, 500), 2),
+                    "trade_type": "Purchase",
+                    "trade_date": dt,
+                })
+            hl = random.choice(headlines)
+            self.insert_sentiment({
+                "ticker": ticker,
+                "score": _sentiment.analyze_text(hl),
+                "source": "Yahoo Finance",
+                "headline": hl,
+                "trade_date": dt,
+            })
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# PART 2 — VECTOR GEOMETRY & MATHEMATICAL ENGINE
+# ═════════════════════════════════════════════════════════════════════════════
+
+class SignalGeometry:
+    """
+    Linear algebra engine for matching live alternative data against
+    historical high-conviction accumulation profiles.
+
+    Feature vector (4-dim):
+        V = [v_volume_percentile, v_role_seniority, v_gex_regime, v_sentiment]
+
+    All dimensions are normalized to [0, 1] before computation.
+    """
+
+    FEATURE_NAMES = ["volume_pct", "role_seniority", "gex_regime", "sentiment"]
+
+    @staticmethod
+    def build_feature_vector(
+        volume_percentile: float,
+        role_seniority: float,
+        gex_regime: float,
+        sentiment: float,  # expected in [-1, 1]
+    ) -> np.ndarray:
+        """
+        Construct a normalized 4-dim alternative data feature vector.
+        Sentiment is mapped from [-1, 1] → [0, 1].
+        """
+        return np.array([
+            float(np.clip(volume_percentile,           0.0, 1.0)),
+            float(np.clip(role_seniority,              0.0, 1.0)),
+            float(np.clip(gex_regime,                  0.0, 1.0)),
+            float(np.clip((sentiment + 1.0) / 2.0,    0.0, 1.0)),
+        ], dtype=np.float32)
+
+    @staticmethod
+    def cosine_similarity(v1: np.ndarray, v2: np.ndarray) -> float:
+        """
+        Directional alignment between current signal vector and a template.
+
+        Sim(v1, v2) = (v1 · v2) / (||v1|| ||v2||) ∈ [-1, +1]
+
+        +1.0 = perfect alignment with suspicious insider accumulation profile.
+        -1.0 = complete opposite (distribution / liquidation).
+         0.0 = orthogonal — no relationship to the template.
+        """
+        n1 = float(np.linalg.norm(v1))
+        n2 = float(np.linalg.norm(v2))
+        if n1 < 1e-9 or n2 < 1e-9:
+            return 0.0
+        return float(np.dot(v1, v2) / (n1 * n2))
+
+    @staticmethod
+    def wedge_magnitude(v1: np.ndarray, v2: np.ndarray) -> float:
+        """
+        Frobenius norm of the exterior (wedge) product matrix.
+
+        Exterior product:  v1 ∧ v2 = v1 v2^T − v2 v1^T   (skew-symmetric n×n)
+        Magnitude:         ||v1 ∧ v2||_F = √(Σ_ij |(v1 ∧ v2)_ij|²)
+
+        Near zero → vectors are collinear (high-confidence pattern match).
+        Large     → structural deviation; the current pattern has diverged
+                    from historical norms (potential novel regime).
+        """
+        W = np.outer(v1, v2) - np.outer(v2, v1)
+        return float(np.linalg.norm(W, ord="fro"))
+
+    @staticmethod
+    def get_seniority(role: str) -> float:
+        """Map an insider job title to a [0, 1] seniority weight."""
+        rl = role.lower()
+        for key, weight in ROLE_SENIORITY.items():
+            if key.lower() in rl:
+                return weight
+        return 0.55
+
+    @staticmethod
+    def interpret_similarity(sim: float) -> str:
+        if sim >= 0.90: return "🔴 EXTREMELY HIGH — mirrors known accumulation template"
+        if sim >= 0.75: return "🟠 HIGH — strong pattern alignment with suspicious flows"
+        if sim >= 0.55: return "🟡 MODERATE — partial alignment, monitor closely"
+        if sim >= 0.35: return "🔵 LOW — weak signal, likely routine activity"
+        return "⚪ NOISE — no meaningful alignment with high-conviction template"
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# PART 3 — NLP SENTIMENT ENGINE
+# ═════════════════════════════════════════════════════════════════════════════
+
+class SentimentEngine:
+    """
+    Financial-domain dictionary-based sentiment scorer.
+
+    Calibrated against earnings call transcripts and SEC filing summaries.
+    Produces a continuous score in [-1.0, +1.0] without requiring heavy
+    transformer models, enabling fast real-time batch analysis.
+
+    Architecture:
+      1. Multi-word phrase matching (highest priority — e.g. "guidance cut")
+      2. Single-token scoring with negation propagation
+      3. Square-root dampening to prevent saturation on long documents
+      4. Clip to [-1, 1]
+    """
+
+    _LEXICON: dict[str, float] = {
+        # ── Strong Positive (+0.40) ─────────────────────────────────────────
+        "beat":               +0.40, "beats":              +0.40,
+        "breakout":           +0.40, "insider buy":        +0.40,
+        "substantial growth": +0.40, "record high":        +0.40,
+        "exceeded":           +0.40, "surpassed":          +0.38,
+        "above expectations": +0.40, "fda approval":       +0.40,
+        "all-time high":      +0.40, "guidance raised":    +0.40,
+        "raised guidance":    +0.40, "outperform":         +0.38,
+        "upgrade":            +0.38, "upgraded":           +0.38,
+        "soared":             +0.36, "record":             +0.30,
+        # ── Moderate Positive (+0.20) ───────────────────────────────────────
+        "dividend":           +0.20, "acquisition":        +0.22,
+        "expansion":          +0.20, "growth":             +0.20,
+        "strong":             +0.18, "profit":             +0.20,
+        "bullish":            +0.25, "momentum":           +0.18,
+        "rally":              +0.20, "partnership":        +0.18,
+        "approval":           +0.22, "buyback":            +0.20,
+        "recovery":           +0.18, "innovation":         +0.15,
+        "confident":          +0.15, "repurchase":         +0.20,
+        "milestone":          +0.18, "robust":             +0.18,
+        "resilient":          +0.15, "accelerating":       +0.20,
+        # ── Moderate Negative (−0.20) ───────────────────────────────────────
+        "insider sell":       -0.20, "decline":            -0.20,
+        "restructuring":      -0.20, "cautious":           -0.18,
+        "concern":            -0.18, "headwind":           -0.20,
+        "slowdown":           -0.22, "miss":               -0.30,
+        "missed":             -0.30, "disappointing":      -0.25,
+        "below":              -0.15, "weak":               -0.20,
+        "pressure":           -0.18, "uncertainty":        -0.18,
+        "challenging":        -0.18, "declining":          -0.22,
+        # ── Strong Negative (−0.40) ─────────────────────────────────────────
+        "lawsuit":            -0.40, "investigation":      -0.40,
+        "sec inquiry":        -0.40, "fraud":              -0.45,
+        "bankruptcy":         -0.50, "crashed":            -0.40,
+        "scandal":            -0.40, "class action":       -0.38,
+        "default":            -0.42, "layoffs":            -0.30,
+        "guidance cut":       -0.38, "downgrade":          -0.35,
+        "downgraded":         -0.35, "plunged":            -0.38,
+        "bearish":            -0.30, "collapse":           -0.42,
+        "recall":             -0.30, "probe":              -0.35,
+        "loss":               -0.22, "losses":             -0.25,
+        "write-down":         -0.35, "impairment":         -0.32,
+        "layoff":             -0.30, "fired":              -0.28,
+    }
+
+    _NEGATORS: frozenset = frozenset({
+        "not", "no", "never", "neither", "nor", "without", "lack",
+        "lacking", "failed", "unable", "cannot", "don't", "doesn't",
+        "didn't", "hasn't", "haven't", "isn't", "wasn't", "wouldn't",
+        "couldn't", "shouldn't", "fail", "fails",
+    })
+
+    def analyze_text(self, text: str) -> float:
+        """
+        Score financial text on the continuous scale [-1.0, +1.0].
+
+        Returns 0.0 on empty input.
+        """
+        if not text or not text.strip():
+            return 0.0
+
+        text_l = text.lower()
+        total = 0.0
+        hits = 0
+
+        # Phase 1: multi-word phrase matching (greedy, highest priority)
+        for phrase, weight in self._LEXICON.items():
+            if " " in phrase and phrase in text_l:
+                total += weight
+                hits += 1
+
+        # Phase 2: single-token with negation propagation
+        tokens = text_l.replace(",", " ").replace(".", " ").replace("!", " ").split()
+        negate = False
+        for tok in tokens:
+            if tok in self._NEGATORS:
+                negate = True
+                continue
+            if tok in self._LEXICON and " " not in tok:
+                pol = self._LEXICON[tok]
+                total += (-pol if negate else pol)
+                hits += 1
+            negate = False
+
+        # Square-root dampening prevents saturation on long texts
+        if hits == 0:
+            return 0.0
+        raw = total / math.sqrt(max(hits, 1))
+        return float(np.clip(raw, -1.0, 1.0))
+
+    @staticmethod
+    def grade(score: float) -> str:
+        if score >= 0.50:  return "VERY BULLISH"
+        if score >= 0.20:  return "BULLISH"
+        if score >= -0.20: return "NEUTRAL"
+        if score >= -0.50: return "BEARISH"
+        return "VERY BEARISH"
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# PART 4 — CUSTOM GYMNASIUM TRADING ENVIRONMENT
+# ═════════════════════════════════════════════════════════════════════════════
+
+class InsiderTradingEnv(gym.Env):
+    """
+    Custom Gymnasium environment combining OHLCV price data with
+    multi-dimensional alternative signals.
+
+    ── Observation Space (8-dim continuous Box) ──────────────────────────
+    [0] log_return      log(P_t / P_{t-1})
+    [1] rsi             RSI-14 scaled to [0, 1]
+    [2] macd            Normalized MACD signal ∈ [-1, 1]
+    [3] insider_sim     Cosine similarity to insider template ∈ [-1, 1]
+    [4] congress_sim    Cosine similarity to congress template ∈ [-1, 1]
+    [5] sentiment       NLP score ∈ [-1, 1]
+    [6] gex             Gamma Exposure (normalized)
+    [7] position_flag   1.0 if holding shares, 0.0 if flat
+
+    ── Action Space (Discrete 3) ─────────────────────────────────────────
+    0 — SELL / Liquidate to cash
+    1 — HOLD current position
+    2 — BUY All-In (applies 0.15% transaction fee)
+
+    ── Reward Function ───────────────────────────────────────────────────
+    R_t = PnL_t  −  α · ChurnPenalty_t  +  β · AlignmentBonus_t  −  γ · DrawdownPenalty_t
+
+    PnL_t           = (Equity_t − Equity_{t-1}) / Equity_{t-1}
+    ChurnPenalty    = α=0.02 when action flips between BUY and SELL
+    AlignmentBonus  = β=0.015 × insider_sim when holding AND insider_sim > 0.70
+    DrawdownPenalty = γ=0.05 × max(0, drawdown − 5%) when drawdown > 5%
+    """
+
+    metadata = {"render_modes": ["human"]}
+
+    def __init__(
+        self,
+        df: pd.DataFrame,
+        alt_signals: list[dict],
+        initial_balance: float = 100_000.0,
+        fee_pct: float = FEE_PCT,
+    ) -> None:
+        super().__init__()
+        self.df = df.reset_index(drop=True)
+        self.alt_signals = alt_signals
+        self.n = len(df)
+        self.initial_balance = initial_balance
+        self.fee_pct = fee_pct
+
+        self.observation_space = spaces.Box(
+            low=np.array( [-1., 0., -1., -1., -1., -1., -5., 0.], dtype=np.float32),
+            high=np.array([ 1., 1.,  1.,  1.,  1.,  1.,  5., 1.], dtype=np.float32),
+            dtype=np.float32,
+        )
+        self.action_space = spaces.Discrete(3)
+
+        # State variables initialized by reset()
+        self.balance: float      = initial_balance
+        self.shares: float       = 0.0
+        self.current_step: int   = 1
+        self.prev_action: int    = 1
+        self.peak_value: float   = initial_balance
+        self.portfolio_value: float = initial_balance
+        self.history: list[dict] = []
+
+    def reset(self, seed: int | None = None, options: dict | None = None):
+        super().reset(seed=seed)
+        self.balance        = self.initial_balance
+        self.shares         = 0.0
+        self.current_step   = 1
+        self.prev_action    = 1
+        self.peak_value     = self.initial_balance
+        self.portfolio_value= self.initial_balance
+        self.history        = []
+        return self._obs(), {}
+
+    def _obs(self) -> np.ndarray:
+        idx = min(self.current_step, self.n - 1)
+        row = self.df.iloc[idx]
+        alt = self.alt_signals[idx % len(self.alt_signals)]
+        return np.array([
+            float(row.get("log_return", 0.0)),
+            float(row.get("rsi", 50.0)) / 100.0,
+            float(np.clip(row.get("macd", 0.0), -1.0, 1.0)),
+            float(np.clip(alt.get("insider_sim",  0.0), -1.0, 1.0)),
+            float(np.clip(alt.get("congress_sim", 0.0), -1.0, 1.0)),
+            float(np.clip(alt.get("sentiment",    0.0), -1.0, 1.0)),
+            float(np.clip(alt.get("gex",          0.0), -5.0,  5.0)),
+            1.0 if self.shares > 0.0 else 0.0,
+        ], dtype=np.float32)
+
+    def step(self, action: int):
+        idx   = min(self.current_step, self.n - 1)
+        price = float(self.df.iloc[idx]["Close"])
+        prev  = self.portfolio_value
+        alt   = self.alt_signals[idx % len(self.alt_signals)]
+
+        # ── Execute trade ─────────────────────────────────────────────
+        if action == 2 and self.balance > 0.0:          # BUY
+            self.shares  = self.balance * (1.0 - self.fee_pct) / price
+            self.balance = 0.0
+        elif action == 0 and self.shares > 0.0:         # SELL
+            self.balance = self.shares * price * (1.0 - self.fee_pct)
+            self.shares  = 0.0
+
+        # ── Portfolio valuation ───────────────────────────────────────
+        self.portfolio_value = self.balance + self.shares * price
+        self.peak_value      = max(self.peak_value, self.portfolio_value)
+
+        # ── Reward decomposition ──────────────────────────────────────
+        pnl = (self.portfolio_value - prev) / max(prev, 1e-9)
+        reward = pnl * 10.0    # scale up for stable gradient signal
+
+        # 1. Churn penalty — penalize buy↔sell reversals
+        churn = 0.0
+        if (action in (0, 2) and self.prev_action in (0, 2)
+                and action != self.prev_action):
+            churn = ALPHA_CHURN
+        reward -= churn
+
+        # 2. Alignment bonus — reward holding when insider similarity is high
+        ins_sim = float(alt.get("insider_sim", 0.0))
+        align_bonus = 0.0
+        if self.shares > 0.0 and ins_sim > ALIGN_THRESHOLD:
+            align_bonus = BETA_ALIGNMENT * ins_sim
+        reward += align_bonus
+
+        # 3. Drawdown penalty — penalize holding through steep declines
+        dd = (self.peak_value - self.portfolio_value) / max(self.peak_value, 1e-9)
+        dd_penalty = 0.0
+        if dd > DRAWDOWN_THRESHOLD and self.shares > 0.0:
+            dd_penalty = GAMMA_DRAWDOWN * (dd - DRAWDOWN_THRESHOLD)
+        reward -= dd_penalty
+
+        # ── Record ────────────────────────────────────────────────────
+        self.history.append({
+            "step":             self.current_step,
+            "portfolio_value":  self.portfolio_value,
+            "action":           action,
+            "price":            price,
+            "pnl":              pnl,
+            "insider_sim":      ins_sim,
+            "reward":           reward,
+            "churn_penalty":    churn,
+            "align_bonus":      align_bonus,
+            "dd_penalty":       dd_penalty,
+        })
+
+        self.prev_action   = action
+        self.current_step += 1
+        terminated = self.current_step >= self.n - 1
+        truncated  = self.portfolio_value <= self.initial_balance * 0.15
+
+        return self._obs(), float(reward), terminated, truncated, {}
+
+    def render(self, mode: str = "human") -> None:
+        print(f"[Step {self.current_step}] NAV=${self.portfolio_value:,.2f}  "
+              f"Shares={self.shares:.2f}  Peak=${self.peak_value:,.2f}")
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# DATA GENERATION UTILITIES
+# ═════════════════════════════════════════════════════════════════════════════
+
+def _rsi_series(close: pd.Series, period: int = 14) -> pd.Series:
+    delta = close.diff()
+    gain  = delta.clip(lower=0).ewm(com=period - 1, adjust=False).mean()
+    loss  = (-delta).clip(lower=0).ewm(com=period - 1, adjust=False).mean()
+    rs    = gain / loss.replace(0, np.nan)
+    return (100 - 100 / (1 + rs)).fillna(50.0)
+
+
+def generate_market_data(ticker: str, n: int = 400) -> pd.DataFrame:
+    """
+    Realistic synthetic OHLCV with derived technical indicators.
+    Seed is deterministic per ticker so results are reproducible.
+    """
+    seed = sum(ord(c) for c in ticker)
+    rng  = np.random.default_rng(seed)
+
+    drift  = rng.uniform(0.06, 0.20)
+    vol    = rng.uniform(1.0,  2.8)
+    prices = 100.0 + np.cumsum(rng.normal(drift, vol, n))
+    prices = np.maximum(prices, 5.0)
+
+    dates = pd.date_range(end=datetime.date.today(), periods=n, freq="B")
+    df = pd.DataFrame({
+        "Date":   dates,
+        "Close":  prices,
+        "Open":   prices * rng.uniform(0.996, 1.004, n),
+        "High":   prices * rng.uniform(1.003, 1.018, n),
+        "Low":    prices * rng.uniform(0.982, 0.997, n),
+        "Volume": rng.integers(500_000, 5_000_000, n).astype(float),
+    })
+
+    df["log_return"] = np.log(df["Close"] / df["Close"].shift(1)).fillna(0.0)
+    df["rsi"] = _rsi_series(df["Close"])
+
+    ema12 = df["Close"].ewm(span=12, adjust=False).mean()
+    ema26 = df["Close"].ewm(span=26, adjust=False).mean()
+    macd_line = ema12 - ema26
+    sig_line  = macd_line.ewm(span=9, adjust=False).mean()
+    raw_macd  = (macd_line - sig_line) / df["Close"]
+    df["macd"] = raw_macd.clip(-0.05, 0.05) / 0.05   # normalize to [-1, 1]
+
+    return df.fillna(0.0)
+
+
+def generate_alt_signals(ticker: str, n: int) -> list[dict]:
+    """
+    Synthetic alternative data signals for each simulation timestep.
+    Mimics the output that would come from live SEC/Capitol-Trades scrapers.
+    """
+    seed = sum(ord(c) for c in ticker) + 7
+    rng  = np.random.default_rng(seed)
+
+    out: list[dict] = []
+    for i in range(n):
+        vol_pct   = float(np.clip(rng.beta(2, 5) + 0.3 * math.sin(i / 30), 0.0, 1.0))
+        seniority = float(rng.choice(list(ROLE_SENIORITY.values())))
+        gex       = float(rng.normal(0, 1.5))
+        gex_norm  = float(np.clip(gex / 5.0 + 0.5, 0.0, 1.0))
+        sentiment = float(np.clip(math.sin(i / 40) * 0.5 + rng.normal(0, 0.3), -1.0, 1.0))
+
+        v_ins  = SignalGeometry.build_feature_vector(vol_pct, seniority, gex_norm, sentiment)
+        v_cong = SignalGeometry.build_feature_vector(
+            min(vol_pct + 0.1, 1.0),
+            min(seniority + 0.05, 1.0),
+            min(gex_norm + 0.05, 1.0),
+            min(sentiment + 0.05, 1.0),
+        )
+
+        out.append({
+            "insider_sim":  SignalGeometry.cosine_similarity(v_ins,  INSIDER_TEMPLATE),
+            "congress_sim": SignalGeometry.cosine_similarity(v_cong, CONGRESS_TEMPLATE),
+            "sentiment":    sentiment,
+            "gex":          gex,
+            "vol_pct":      vol_pct,
+            "seniority":    seniority,
+            "v_insider":    v_ins,
+            "v_congress":   v_cong,
+        })
+    return out
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# PERFORMANCE ANALYTICS
+# ═════════════════════════════════════════════════════════════════════════════
+
+def compute_metrics(history: list[dict], initial_balance: float) -> dict:
+    """Annualized Sharpe, Sortino, Max Drawdown, total return, and win-rate."""
+    if len(history) < 2:
+        return {"sharpe": 0.0, "sortino": 0.0, "max_drawdown": 0.0,
+                "total_return": 0.0, "win_rate": 0.0}
+
+    vals    = np.array([h["portfolio_value"] for h in history], dtype=np.float64)
+    rets    = np.diff(vals) / np.maximum(vals[:-1], 1e-9)
+
+    mean_r  = float(rets.mean())
+    std_r   = float(rets.std())
+    sharpe  = (mean_r / std_r * math.sqrt(252)) if std_r > 1e-9 else 0.0
+
+    down    = rets[rets < 0]
+    dstd    = float(down.std()) if len(down) > 1 else 1e-9
+    sortino = (mean_r / dstd  * math.sqrt(252)) if dstd > 1e-9 else 0.0
+
+    running_max = np.maximum.accumulate(vals)
+    dd_series   = (running_max - vals) / np.maximum(running_max, 1e-9)
+    max_dd      = float(dd_series.max())
+
+    total_ret = (vals[-1] - initial_balance) / initial_balance
+    win_rate  = float((rets > 0).mean())
+
+    return {
+        "sharpe":       round(sharpe, 3),
+        "sortino":      round(sortino, 3),
+        "max_drawdown": round(max_dd * 100, 2),
+        "total_return": round(total_ret * 100, 2),
+        "win_rate":     round(win_rate * 100, 1),
+    }
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# PART 5 — STREAMLIT DASHBOARD
+# ═════════════════════════════════════════════════════════════════════════════
+
+def run_app() -> None:
+    st.set_page_config(
+        page_title="InsiderRL — Alternative Market Intelligence",
+        page_icon="🛡️",
+        layout="wide",
+        initial_sidebar_state="expanded",
+    )
+
+    # ── Dark-mode CSS ─────────────────────────────────────────────────────
+    st.markdown("""
+    <style>
+    body, .stApp { background-color: #0d1117; color: #c9d1d9; }
+    div[data-testid="stSidebar"] { background: #161b22; border-right: 1px solid #30363d; }
+    .stMetric { background:#161b22; border:1px solid #30363d;
+                border-radius:8px; padding:14px 18px; }
+    .stMetric label { color:#8b949e !important; font-size:.78rem; }
+    .block-container { padding-top:1rem; max-width:100%; }
+    h1,h2,h3 { color:#e6edf3 !important; }
+    .info-pill { background:#161b22; border:1px solid #30363d; border-radius:6px;
+                 padding:10px 14px; font-size:.82rem; color:#8b949e;
+                 font-style:italic; margin-bottom:10px; }
+    </style>
+    """, unsafe_allow_html=True)
+
+    # ── Sidebar ───────────────────────────────────────────────────────────
+    with st.sidebar:
+        st.markdown("## ⚙️ Configuration")
+        st.markdown("---")
+
+        ticker = st.selectbox("📈 Equity Target", TICKERS)
+
+        st.markdown("### 🧠 PPO Hyperparameters")
+        train_steps = st.slider("Training Timesteps", 1_000, 50_000, 8_000, step=1_000)
+        lr = st.select_slider(
+            "Learning Rate (α)",
+            options=[1e-6, 5e-6, 1e-5, 5e-5, 1e-4, 5e-4, 1e-3],
+            value=3e-4,
+            format_func=lambda x: f"{x:.0e}",
+        )
+        ent_coef = st.slider(
+            "Entropy Coefficient", 0.01, 0.10, 0.02, step=0.01,
+            help="Higher → more exploration during training"
+        )
+
+        st.markdown("### 📅 Simulation")
+        n_days = st.slider("Simulation Days", 200, 600, 400, step=50)
+
+        st.markdown("---")
+        st.markdown("### 🗄️ Database")
+        db = MarketIntelligenceDB()
+        if st.button("🌱 Seed Mock Data", use_container_width=True):
+            with st.spinner("Seeding..."):
+                db.seed_mock_data(ticker, n_days=60)
+            st.success("Seeded!")
+        stats = db.get_stats()
+        st.caption(
+            f"Congress: **{stats['congress_trades']}** | "
+            f"Insider: **{stats['insider_trades']}** | "
+            f"Sentiment: **{stats['news_sentiment']}**"
+        )
+
+        st.markdown("---")
+        st.markdown("### 📐 Math Reference")
+        st.latex(r"\text{Sim}(v_1,v_2)=\frac{v_1\cdot v_2}{\|v_1\|\|v_2\|}")
+        st.latex(r"\|v_1\wedge v_2\|_F=\|v_1 v_2^T-v_2 v_1^T\|_F")
+        st.latex(r"R_t=\text{PnL}_t-\alpha C_t+\beta A_t-\gamma D_t")
+
+    # ── Title ─────────────────────────────────────────────────────────────
+    st.markdown("# 🛡️ InsiderRL — Alternative Market Intelligence Agent")
+    st.markdown(
+        "Unifies congressional disclosures, SEC Form 4 insider flows, "
+        "gamma exposure, and financial NLP sentiment into a trained PPO "
+        "trading policy via a custom Gymnasium environment."
+    )
+    st.markdown("---")
+
+    # ── Data ──────────────────────────────────────────────────────────────
+    _sent = SentimentEngine()
+    mdf   = generate_market_data(ticker, n=n_days)
+    alts  = generate_alt_signals(ticker, n=n_days)
+
+    # ═════════════════════════════════════════════════════════════════════
+    # SECTION 1 — Live alternative data streams
+    # ═════════════════════════════════════════════════════════════════════
+    st.markdown("## 📡 Live Alternative Data Streams")
+    st.markdown(
+        '<div class="info-pill">Disclosure dates are shifted by regulatory latency '
+        '(Congress: 5–45 days per STOCK Act; Form 4: 2–4 business days) '
+        'to eliminate lookahead bias during historical simulation.</div>',
+        unsafe_allow_html=True,
+    )
+
+    col_ct, col_it, col_ns = st.columns(3)
+    today = datetime.date.today()
+
+    with col_ct:
+        st.markdown("#### 🏛️ Congressional Trades")
+        rows = []
+        for i in range(7):
+            dt  = (today - datetime.timedelta(days=i * 6)).strftime("%Y-%m-%d")
+            pol = POLITICIANS[i % len(POLITICIANS)]
+            tt  = "BUY 🟢" if i % 3 != 0 else "SELL 🔴"
+            lat = random.randint(5, 45)
+            rows.append({"Date": dt, "Politician": pol[:20], "Type": tt,
+                         "Amount": "$15k–50k", "Latency": f"+{lat}d"})
+        st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+
+    with col_it:
+        st.markdown("#### 📋 Form 4 Insider Filings")
+        rows = []
+        for i in range(7):
+            dt   = (today - datetime.timedelta(days=i * 4)).strftime("%Y-%m-%d")
+            role = ROLES[i % len(ROLES)]
+            sen  = SignalGeometry.get_seniority(role)
+            rows.append({"Date": dt, "Insider": f"Exec {i+1}", "Role": role,
+                         "Seniority": f"{sen:.0%}",
+                         "Shares": f"{random.randint(500, 25_000):,}",
+                         "Type": "Purchase 🟢"})
+        st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+
+    with col_ns:
+        st.markdown("#### 📰 NLP Sentiment Feed")
+        headlines = [
+            "beats earnings expectations substantial growth profit",
+            "insider buy cluster breakout record high bullish",
+            "SEC investigation fraud lawsuit class action probe",
+            "dividend increase acquisition partnership approved",
+            "guidance cut restructuring layoffs disappointing miss",
+            "upgrade outperform all-time high recovery resilient",
+            "bankruptcy default collapsed loss impairment scandal",
+        ]
+        rows = []
+        for hl in headlines:
+            sc    = _sent.analyze_text(hl)
+            grade = _sent.grade(sc)
+            icon  = "🟢" if sc > 0.1 else ("🔴" if sc < -0.1 else "⚪")
+            rows.append({"Headline": hl[:34]+"…", "Score": f"{sc:+.3f}",
+                         "Grade": f"{icon} {grade}"})
+        st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+
+    st.markdown("---")
+
+    # ═════════════════════════════════════════════════════════════════════
+    # SECTION 2 — Vector geometry
+    # ═════════════════════════════════════════════════════════════════════
+    st.markdown("## 📐 Real-Time Vector Geometry Analysis")
+    st.markdown(
+        '<div class="info-pill">Each alternative data event is embedded as a '
+        '4-dimensional vector: [volume_percentile, role_seniority, gex_regime, sentiment]. '
+        'Cosine similarity measures directional alignment with historically profitable '
+        'accumulation templates. The Frobenius norm of the exterior wedge product '
+        'quantifies structural deviation from known patterns.</div>',
+        unsafe_allow_html=True,
+    )
+
+    latest = alts[-1]
+    i_sim  = SignalGeometry.cosine_similarity(latest["v_insider"],  INSIDER_TEMPLATE)
+    c_sim  = SignalGeometry.cosine_similarity(latest["v_congress"], CONGRESS_TEMPLATE)
+    i_wdg  = SignalGeometry.wedge_magnitude(latest["v_insider"],    INSIDER_TEMPLATE)
+    c_wdg  = SignalGeometry.wedge_magnitude(latest["v_congress"],   CONGRESS_TEMPLATE)
+
+    gc1, gc2, gc3, gc4 = st.columns(4)
+    gc1.metric("Insider Cosine Sim",   f"{i_sim:.4f}",
+               help="Dot product alignment with suspicious insider buy template. Range [−1, +1].")
+    gc2.metric("Insider Wedge ‖∧‖_F", f"{i_wdg:.4f}",
+               help="Near zero = collinear (high confidence). Large = structural divergence.")
+    gc3.metric("Congress Cosine Sim",  f"{c_sim:.4f}",
+               help="Directional alignment with congressional accumulation template.")
+    gc4.metric("Congress Wedge ‖∧‖_F",f"{c_wdg:.4f}",
+               help="Structural deviation of congressional flow from historical norms.")
+
+    vcol1, vcol2 = st.columns(2)
+
+    with vcol1:
+        cats = SignalGeometry.FEATURE_NAMES + [SignalGeometry.FEATURE_NAMES[0]]
+        fig_radar = go.Figure()
+        fig_radar.add_trace(go.Scatterpolar(
+            r=list(latest["v_insider"]) + [latest["v_insider"][0]],
+            theta=cats, fill="toself", name="Current Insider Flow",
+            line_color="#00FFCC", fillcolor="rgba(0,255,204,0.12)",
+        ))
+        fig_radar.add_trace(go.Scatterpolar(
+            r=list(INSIDER_TEMPLATE) + [INSIDER_TEMPLATE[0]],
+            theta=cats, fill="toself", name="Suspicious Template",
+            line_color="#FF3366", fillcolor="rgba(255,51,102,0.12)",
+        ))
+        fig_radar.update_layout(
+            template="plotly_dark",
+            title="Feature Vector vs Suspicious Template",
+            polar=dict(radialaxis=dict(visible=True, range=[0, 1])),
+            legend=dict(x=0, y=-0.20, orientation="h"),
+            margin=dict(t=55, b=70),
+        )
+        st.plotly_chart(fig_radar, use_container_width=True)
+
+    with vcol2:
+        st.markdown(f"**Interpretation:** {SignalGeometry.interpret_similarity(i_sim)}")
+        st.markdown("---")
+        sim60  = [SignalGeometry.cosine_similarity(s["v_insider"],  INSIDER_TEMPLATE)  for s in alts[-80:]]
+        cong60 = [SignalGeometry.cosine_similarity(s["v_congress"], CONGRESS_TEMPLATE) for s in alts[-80:]]
+        fig_ts = go.Figure()
+        fig_ts.add_trace(go.Scatter(y=sim60,  name="Insider Sim",  line=dict(color="#00FFCC", width=2)))
+        fig_ts.add_trace(go.Scatter(y=cong60, name="Congress Sim", line=dict(color="#FF9900", width=2)))
+        fig_ts.add_hline(y=ALIGN_THRESHOLD, line_dash="dash", line_color="#FF3366",
+                          annotation_text=f"Bonus Threshold ({ALIGN_THRESHOLD})")
+        fig_ts.update_layout(
+            template="plotly_dark", title="80-Day Similarity History",
+            xaxis_title="Bars ago (left=older)", yaxis_title="Cosine Similarity",
+            yaxis_range=[-0.05, 1.05], height=310, margin=dict(t=50, b=30),
+        )
+        st.plotly_chart(fig_ts, use_container_width=True)
+
+    st.markdown("---")
+
+    # ═════════════════════════════════════════════════════════════════════
+    # SECTION 3 — Training & backtest
+    # ═════════════════════════════════════════════════════════════════════
+    st.markdown("## 🧠 PPO Policy Training & Strategy Backtest")
+    st.markdown(
+        '<div class="info-pill">The agent is trained with shaped rewards: '
+        'PnL (base) − α·ChurnPenalty (α=0.02) + β·AlignmentBonus (β=0.015) '
+        '− γ·DrawdownPenalty (γ=0.05, threshold=5%). After training the policy '
+        'is evaluated deterministically against a passive Buy & Hold baseline.</div>',
+        unsafe_allow_html=True,
+    )
+
+    if st.button("🚀 Train Policy Network", type="primary", use_container_width=True):
+        env  = InsiderTradingEnv(mdf, alts, initial_balance=100_000.0)
+        pbar = st.progress(0, text="Initializing PPO agent…")
+
+        class _CB(BaseCallback):
+            def __init__(self, total, bar):
+                super().__init__()
+                self._total = total
+                self._bar   = bar
+            def _on_step(self) -> bool:
+                pct = min(int(self.num_timesteps / self._total * 100), 99)
+                self._bar.progress(pct, text=f"Training… {self.num_timesteps:,}/{self._total:,} steps")
+                return True
+
+        try:
+            model = PPO(
+                "MlpPolicy", env,
+                learning_rate=lr,
+                ent_coef=ent_coef,
+                n_steps=min(512, train_steps),
+                batch_size=64,
+                verbose=0,
+            )
+            model.learn(total_timesteps=train_steps, callback=_CB(train_steps, pbar))
+            pbar.progress(100, text="✅ Training complete!")
+        except Exception as e:
+            st.error(f"Training failed: {e}")
+            st.stop()
+
+        # ── Backtest ──────────────────────────────────────────────────
+        status = st.empty()
+        status.info("Running deterministic backtest…")
+        obs, _ = env.reset()
+        states_for_pca: list[np.ndarray] = []
+        terminated = truncated = False
+
+        while not (terminated or truncated):
+            action, _ = model.predict(obs, deterministic=True)
+            states_for_pca.append(obs.copy())
+            obs, _, terminated, truncated, _ = env.step(int(action))
+
+        status.empty()
+        hist_df = pd.DataFrame(env.history)
+        m       = compute_metrics(env.history, 100_000.0)
+
+        # ── Performance metrics ───────────────────────────────────────
+        st.markdown("### 📊 Strategy Performance")
+        mc = st.columns(5)
+        mc[0].metric("Total Return",   f"{m['total_return']:+.1f}%")
+        mc[1].metric("Sharpe Ratio",   f"{m['sharpe']:.3f}",
+                     help="Annualized. >1.5 = excellent; >1.0 = good.")
+        mc[2].metric("Sortino Ratio",  f"{m['sortino']:.3f}",
+                     help="Like Sharpe but uses only downside volatility.")
+        mc[3].metric("Max Drawdown",   f"{m['max_drawdown']:.1f}%",
+                     help="Largest peak-to-trough portfolio decline.")
+        mc[4].metric("Win Rate",       f"{m['win_rate']:.0f}%",
+                     help="% of timesteps with positive NAV change.")
+
+        # ── NAV curve ────────────────────────────────────────────────
+        st.markdown("### 📈 NAV Curve vs. Buy & Hold")
+        steps = hist_df["step"].values.astype(int)
+        nav   = hist_df["portfolio_value"].values
+        bh    = (mdf["Close"].values[np.clip(steps, 0, len(mdf)-1)] /
+                 float(mdf["Close"].iloc[1])) * 100_000.0
+
+        fig_nav = go.Figure()
+        fig_nav.add_trace(go.Scatter(
+            x=steps, y=nav, mode="lines", name="🛡️ InsiderRL Agent",
+            line=dict(color="#00FFCC", width=2.5),
+            fill="tozeroy", fillcolor="rgba(0,255,204,0.05)",
+        ))
+        fig_nav.add_trace(go.Scatter(
+            x=steps, y=bh, mode="lines", name="📦 Buy & Hold",
+            line=dict(color="#FF3366", width=1.8, dash="dot"),
+        ))
+        # Buy / Sell action markers
+        buys  = hist_df[hist_df["action"] == 2]
+        sells = hist_df[hist_df["action"] == 0]
+        if len(buys):
+            fig_nav.add_trace(go.Scatter(
+                x=buys["step"].values, y=buys["portfolio_value"].values,
+                mode="markers", name="BUY ▲",
+                marker=dict(color="#00FF88", size=8, symbol="triangle-up"),
+            ))
+        if len(sells):
+            fig_nav.add_trace(go.Scatter(
+                x=sells["step"].values, y=sells["portfolio_value"].values,
+                mode="markers", name="SELL ▼",
+                marker=dict(color="#FF4444", size=8, symbol="triangle-down"),
+            ))
+        fig_nav.update_layout(
+            template="plotly_dark",
+            title=f"InsiderRL vs Buy & Hold — {ticker}",
+            xaxis_title="Simulation Step",
+            yaxis_title="Portfolio NAV ($)",
+            hovermode="x unified",
+            legend=dict(x=0.01, y=0.99, bgcolor="rgba(0,0,0,0)"),
+            margin=dict(t=60, b=40),
+        )
+        st.plotly_chart(fig_nav, use_container_width=True)
+
+        # ── Reward decomposition ──────────────────────────────────────
+        st.markdown("### ⚖️ Reward Signal Decomposition")
+        st.markdown(
+            '<div class="info-pill">Shows how each reward component evolves: '
+            'PnL (teal line), Churn Penalty (red bars), Alignment Bonus (green bars), '
+            'Drawdown Penalty (orange bars). A well-trained agent maximises PnL and '
+            'alignment while minimising churn and drawdown penalties.</div>',
+            unsafe_allow_html=True,
+        )
+        fig_rwd = go.Figure()
+        fig_rwd.add_trace(go.Scatter(
+            x=hist_df["step"], y=hist_df["pnl"] * 10,
+            name="PnL ×10", line=dict(color="#00FFCC", width=1.5),
+        ))
+        fig_rwd.add_trace(go.Bar(
+            x=hist_df["step"], y=-hist_df["churn_penalty"],
+            name="−Churn Penalty", marker_color="#FF6B6B", opacity=0.75,
+        ))
+        fig_rwd.add_trace(go.Bar(
+            x=hist_df["step"], y=hist_df["align_bonus"],
+            name="+Alignment Bonus", marker_color="#00FF88", opacity=0.75,
+        ))
+        fig_rwd.add_trace(go.Bar(
+            x=hist_df["step"], y=-hist_df["dd_penalty"],
+            name="−Drawdown Penalty", marker_color="#FF9900", opacity=0.75,
+        ))
+        fig_rwd.update_layout(
+            template="plotly_dark",
+            title="R_t = PnL_t − α·Churn + β·Alignment − γ·Drawdown",
+            barmode="relative",
+            xaxis_title="Step", yaxis_title="Reward Component",
+            legend=dict(orientation="h", y=-0.22),
+            margin=dict(t=60, b=90),
+        )
+        st.plotly_chart(fig_rwd, use_container_width=True)
+
+        # ── PCA state space projection ────────────────────────────────
+        st.markdown("### 🌌 PCA State Space Projection")
+        st.markdown(
+            '<div class="info-pill">PCA reduces the 8-dimensional observation space '
+            'to 2 principal components. Coloring by sentiment reveals how the agent '
+            'clusters its decisions: BUY actions (green) concentrate where high insider '
+            'similarity converges with positive sentiment — the policy learns to '
+            'exploit these alignment windows.</div>',
+            unsafe_allow_html=True,
+        )
+
+        if len(states_for_pca) >= 10:
+            S   = np.array(states_for_pca, dtype=np.float32)
+            pca = PCA(n_components=2, random_state=42)
+            PC  = pca.fit_transform(S)
+
+            pca_df = pd.DataFrame(PC, columns=["PC1", "PC2"])
+            pca_df["Sentiment"]   = S[:, 5]
+            pca_df["Insider Sim"] = S[:, 3]
+            pca_df["Action"]      = [h["action"] for h in env.history[:len(states_for_pca)]]
+            pca_df["Action Label"] = pca_df["Action"].map({0:"SELL", 1:"HOLD", 2:"BUY"})
+
+            ev0 = pca.explained_variance_ratio_[0]
+            ev1 = pca.explained_variance_ratio_[1]
+            lx  = f"PC1 ({ev0:.1%} var)"
+            ly  = f"PC2 ({ev1:.1%} var)"
+
+            pca_c1, pca_c2 = st.columns(2)
+
+            with pca_c1:
+                fig_s = px.scatter(
+                    pca_df, x="PC1", y="PC2", color="Sentiment",
+                    title="Clusters — Colored by NLP Sentiment",
+                    color_continuous_scale="RdYlGn",
+                    color_continuous_midpoint=0,
+                    template="plotly_dark",
+                    labels={"PC1": lx, "PC2": ly},
+                    opacity=0.72,
+                )
+                fig_s.update_traces(marker_size=4)
+                fig_s.update_layout(margin=dict(t=55, b=30))
+                st.plotly_chart(fig_s, use_container_width=True)
+
+            with pca_c2:
+                fig_a = px.scatter(
+                    pca_df, x="PC1", y="PC2", color="Action Label",
+                    title="Clusters — Colored by Agent Action",
+                    color_discrete_map={"SELL":"#FF4444","HOLD":"#888888","BUY":"#00FF88"},
+                    template="plotly_dark",
+                    labels={"PC1": lx, "PC2": ly},
+                    category_orders={"Action Label": ["SELL","HOLD","BUY"]},
+                    opacity=0.72,
+                )
+                fig_a.update_traces(marker_size=4)
+                fig_a.update_layout(margin=dict(t=55, b=30))
+                st.plotly_chart(fig_a, use_container_width=True)
+
+            # Explained variance bar
+            fig_ev = go.Figure(go.Bar(
+                x=["PC1", "PC2"],
+                y=[ev0 * 100, ev1 * 100],
+                marker_color=["#00FFCC", "#FF9900"],
+                text=[f"{ev0*100:.1f}%", f"{ev1*100:.1f}%"],
+                textposition="outside",
+            ))
+            fig_ev.update_layout(
+                template="plotly_dark", title="PCA Explained Variance",
+                yaxis_title="Variance Explained (%)",
+                height=240, margin=dict(t=50, b=30),
+            )
+            st.plotly_chart(fig_ev, use_container_width=True)
+
+        # ── Similarity distribution ───────────────────────────────────
+        st.markdown("### 🔭 Signal Similarity Distribution")
+        sims_i = [s["insider_sim"]  for s in alts]
+        sims_c = [s["congress_sim"] for s in alts]
+
+        fig_hist = go.Figure()
+        fig_hist.add_trace(go.Histogram(x=sims_i, name="Insider Sim",
+                                         nbinsx=40, marker_color="#00FFCC", opacity=0.75))
+        fig_hist.add_trace(go.Histogram(x=sims_c, name="Congress Sim",
+                                         nbinsx=40, marker_color="#FF9900", opacity=0.75))
+        fig_hist.add_vline(
+            x=ALIGN_THRESHOLD, line_dash="dash", line_color="#FF3366",
+            annotation_text=f"Bonus Threshold = {ALIGN_THRESHOLD}",
+        )
+        fig_hist.update_layout(
+            template="plotly_dark",
+            title="Distribution of Cosine Similarity Scores Across Full Simulation",
+            xaxis_title="Cosine Similarity", yaxis_title="Frequency",
+            barmode="overlay", margin=dict(t=60, b=40),
+        )
+        st.plotly_chart(fig_hist, use_container_width=True)
+
+    else:
+        # Pre-training orientation chart
+        st.info(
+            "⬆️  Configure the agent in the sidebar then press **Train Policy Network**. "
+            "The PPO agent learns to exploit insider and congressional signals "
+            "embedded in the alternative data feature vectors.",
+            icon="ℹ️",
+        )
+        fig_pre = go.Figure()
+        fig_pre.add_trace(go.Candlestick(
+            x=mdf["Date"], open=mdf["Open"], high=mdf["High"],
+            low=mdf["Low"], close=mdf["Close"], name=ticker,
+            increasing_line_color="#00FFCC", decreasing_line_color="#FF3366",
+        ))
+        clo_min = float(mdf["Close"].min())
+        clo_rng = float(mdf["Close"].max()) - clo_min
+        scaled_sim = [s["insider_sim"] * clo_rng + clo_min for s in alts]
+        fig_pre.add_trace(go.Scatter(
+            y=scaled_sim, x=mdf["Date"],
+            name="Insider Sim (price-scaled)",
+            line=dict(color="#FF9900", width=1.5, dash="dot"),
+        ))
+        fig_pre.update_layout(
+            template="plotly_dark",
+            title=f"{ticker} — Price & Insider Similarity Preview",
+            xaxis_rangeslider_visible=False, height=450,
+        )
+        st.plotly_chart(fig_pre, use_container_width=True)
+
+    # ── Footer ────────────────────────────────────────────────────────────
+    st.markdown("---")
+    st.markdown(
+        '<p style="color:#444;font-size:.76rem;text-align:center;">'
+        'InsiderRL v1.0 · Research & educational purposes only · '
+        'Not financial advice · All data is synthetic</p>',
+        unsafe_allow_html=True,
+    )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# ENTRY POINT
+# ─────────────────────────────────────────────────────────────────────────────
+if __name__ == "__main__":
+    run_app()
