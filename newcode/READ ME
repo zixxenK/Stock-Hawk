@@ -1,0 +1,26 @@
+# Flippy Intelligence Engine
+
+A market intelligence engine that combines insider trading analysis with machine learning to generate actionable signals.
+
+## 🚀 Features
+
+- **Single Ticker Analysis**: Submit a ticker and receive a detailed signal with scoring.
+- **Batch Processing**: Analyze up to 100 tickers simultaneously for portfolio-level insights.
+- **Historical Backtesting**: Simulate strategies against historical data to evaluate performance.
+- **Explainable AI**: Each recommendation is backed by pattern hints, sentiment scores, and vector explanations.
+
+## 📡 API Endpoints
+
+| Endpoint | Method | Description |
+|----------|--------|-------------|
+| `/api/v1/analyze/{ticker}` | POST | Analyze a single ticker for signals. |
+| `/api/v1/analyze/batch` | POST | Batch analyze multiple tickers (up to 100). |
+| `/api/v1/backtest` | POST | Simulate and backtest user-defined strategies. |
+| `/api/v1/history/{ticker}` | GET | Retrieve historical signal data for a ticker. |
+
+## 🛠️ Usage Examples
+
+### Single Ticker Analysis
+```bash
+curl -X POST "http://localhost:8000/api/v1/analyze/AAPL?days_back=2" \
+  -H "Content-Type: application/json"

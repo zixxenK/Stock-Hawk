@@ -1,0 +1,38 @@
+{
+  "version": "2.0.0",
+  "tasks": [
+    {
+      "label": "Docker: Build stock-hawk",
+      "type": "shell",
+      "command": "docker buildx build --platform linux/amd64 -t stock-hawk:latest .",
+      "group": "build",
+      "problemMatcher": [],
+      "presentation": {
+        "reveal": "always",
+        "panel": "shared"
+      }
+    },
+    {
+      "label": "Docker: Run stock-hawk",
+      "type": "shell",
+      "command": "docker run -d --name stock-hawk-mcp -p 8000:8000 stock-hawk:latest",
+      "group": "none",
+      "problemMatcher": [],
+      "presentation": {
+        "reveal": "always",
+        "panel": "shared"
+      }
+    },
+    {
+      "label": "Docker: Stop stock-hawk",
+      "type": "shell",
+      "command": "docker stop stock-hawk-mcp && docker rm stock-hawk-mcp",
+      "group": "none",
+      "problemMatcher": [],
+      "presentation": {
+        "reveal": "always",
+        "panel": "shared"
+      }
+    }
+  ]
+}

@@ -1,0 +1,31 @@
+{
+  "name": "Flippy Engine Agent Behavior Hook",
+  "description": "Enforces repository-specific coding and review constraints for the Flippy Engine.",
+  "events": ["SessionStart", "PreToolUse"],
+  "rules": [
+    {
+      "type": "inject_context",
+      "message": "Always consult AGENTS.md and SKILL.md before editing code. Preserve module separation, enforce production-grade implementations, and prefer existing repo structure over new monolithic files."
+    },
+    {
+      "type": "warn",
+      "condition": "code_contains('pass') || code_contains('...') || code_contains('# TODO')",
+      "message": "Do not introduce or leave any pass, ..., or # TODO in structural code. Every method must be fully implemented."
+    },
+    {
+      "type": "warn",
+      "condition": "code_contains('sqlite3.connect') && !code_contains('PRAGMA journal_mode=WAL')",
+      "message": "SQLite persistence must initialize WAL mode via PRAGMA journal_mode=WAL to support concurrent reads during ingestion."
+    },
+    {
+      "type": "warn",
+      "condition": "file_path_endswith('.py') && code_contains('np.array') && !code_contains("dtype=np.float32")",
+      "message": "RL observation vectors must be explicitly cast to np.float32 for Stable-Baselines3 compatibility."
+    },
+    {
+      "type": "block",
+      "condition": "context_requests('mock data') || context_requests('fake data')",
+      "message": "This repository must use real hardened data sources; do not implement mock or placeholder data flows."
+    }
+  ]
+}
