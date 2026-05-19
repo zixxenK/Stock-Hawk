@@ -1,11 +1,17 @@
 import json
 import os
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
 from database.db_manager import DBManager, create_db_adapter, validate_db_adapter
-from rl_insider_trader import MarketIntelligenceDB
+from rl_insider_trader import (
+    MarketIntelligenceDB,
+    is_valid_ticker_symbol,
+    normalize_ticker_symbol,
+    resolve_ticker_universe,
+)
 
 
 def test_db_manager_complies_with_api_adapter_contract():
@@ -54,6 +60,21 @@ def test_market_intelligence_db_analysis_signal_history():
     # Leave the temporary test DB in place; Windows can hold file locks for active connections.
 
 
+def test_market_intelligence_db_recommended_candidate_persistence(tmp_path):
+    db_path = tmp_path / "recommend.db"
+    db = MarketIntelligenceDB(db_path)
+
+    assert db.save_recommended_candidates([
+        {"ticker": "AAPL", "action": "BUY", "alpha_score": 0.92, "sentiment_score": 0.12, "vector": [0.2, 0.3]},
+        {"ticker": "MSFT", "action": "BUY", "alpha_score": 0.73, "sentiment_score": 0.05, "vector": [0.1, 0.4]},
+    ]) is True
+
+    candidates = db.get_recommended_candidates(limit=2, min_score=0.5)
+    assert len(candidates) == 2
+    assert candidates[0]["ticker"] == "AAPL"
+    assert candidates[1]["ticker"] == "MSFT"
+
+
 def test_market_intelligence_db_watchlist_persistence(tmp_path):
     db_path = tmp_path / "watchlist.db"
     db = MarketIntelligenceDB(db_path)
@@ -94,6 +115,58 @@ def test_market_intelligence_db_focus_settings_persistence(tmp_path):
     assert loaded["max_trade_size_pct"] == 0.12
     assert loaded["per_ticker_risk_budget_pct"] == 0.15
     assert loaded["use_watchlist_only"] is False
+
+
+def test_normalize_ticker_symbol_trims_and_upcases():
+    assert normalize_ticker_symbol("  tsla ") == "TSLA"
+    assert normalize_ticker_symbol("brk.b") == "BRK.B"
+    assert normalize_ticker_symbol(" aapl\n") == "AAPL"
+
+
+def test_is_valid_ticker_symbol_accepts_common_formats():
+    assert is_valid_ticker_symbol("AAPL") is True
+    assert is_valid_ticker_symbol("BRK.B") is True
+    assert is_valid_ticker_symbol("MSFT-W") is True
+
+
+def test_is_valid_ticker_symbol_rejects_invalid_formats():
+    assert is_valid_ticker_symbol("") is False
+    assert is_valid_ticker_symbol("AAP L") is False
+    assert is_valid_ticker_symbol("AAPL$") is False
+    assert is_valid_ticker_symbol("TOO_LONG_TICKER") is False
+
+
+def test_resolve_ticker_universe_prefers_watchlist_when_only_flag_enabled():
+    universe, label = resolve_ticker_universe(
+        watchlist_symbols=["tsla", " aapl"],
+        focus_settings={"use_watchlist_only": True},
+        default_universe=["MSFT"],
+        fallback_universe=["NVDA"],
+    )
+    assert universe == ["TSLA", "AAPL"]
+    assert label == "watchlist only"
+
+
+def test_resolve_ticker_universe_combines_sources_when_watchlist_disabled():
+    universe, label = resolve_ticker_universe(
+        watchlist_symbols=["tsla"],
+        focus_settings={"use_watchlist_only": False},
+        default_universe=["MSFT", "tsla", "AAPL"],
+        fallback_universe=["NVDA"],
+    )
+    assert universe == ["TSLA", "MSFT", "AAPL", "NVDA"]
+    assert label == "watchlist + default universe"
+
+
+def test_resolve_ticker_universe_falls_back_to_default_when_watchlist_empty():
+    universe, label = resolve_ticker_universe(
+        watchlist_symbols=[],
+        focus_settings={"use_watchlist_only": True},
+        default_universe=["MSFT"],
+        fallback_universe=["NVDA"],
+    )
+    assert universe == ["MSFT"]
+    assert label == "default universe fallback"
 
 
 def test_market_intelligence_db_recent_hit_tickers(tmp_path):
@@ -163,7 +236,55 @@ def test_create_db_adapter_returns_valid_manager():
     assert hasattr(adapter, "get_insider_trades")
 
 
+def test_database_manager_uses_sqlite_check_same_thread(monkeypatch):
+    created = {}
+
+    class DummyConnection:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc_value, traceback):
+            return False
+
+        def execute(self, _):
+            return []
+
+    class DummyEngine:
+        def begin(self):
+            return DummyConnection()
+
+    def fake_create_engine(db_url, **kwargs):
+        created["db_url"] = db_url
+        created["kwargs"] = kwargs
+        return DummyEngine()
+
+    fake_base = SimpleNamespace(metadata=SimpleNamespace(create_all=lambda engine: None))
+    monkeypatch.setattr("database.db_manager.create_engine", fake_create_engine)
+    monkeypatch.setattr("database.db_manager.Base", fake_base)
+
+    manager = DBManager(db_url="sqlite:///./data/test_hardening.db")
+    assert created["db_url"] == "sqlite:///./data/test_hardening.db"
+    assert "connect_args" in created["kwargs"]
+    assert created["kwargs"]["connect_args"]["check_same_thread"] is False
+    assert manager is not None
+
+
+def test_database_manager_health_and_compaction(tmp_path):
+    db_path = tmp_path / "health.db"
+    db = DBManager(db_url=f"sqlite:///{db_path}")
+
+    health = db.check_health()
+    assert health["healthy"] is True
+    assert health["journal_mode"] == "WAL"
+    assert isinstance(health["table_counts"], dict)
+    assert db.compact_database() is True
+
+
 def test_db_manager_disclosed_signal_method_exists_and_is_explicit():
     db = DBManager()
-    with pytest.raises(NotImplementedError):
-        db.get_disclosed_signals_on_date("AAPL", "2026-05-17")
+    result = db.get_disclosed_signals_on_date("AAPL", "2026-05-17")
+    assert isinstance(result, dict)
+    assert set(result.keys()) == {"congress", "insider", "sentiment"}
+    assert isinstance(result["congress"], list)
+    assert isinstance(result["insider"], list)
+    assert isinstance(result["sentiment"], list)
